@@ -279,7 +279,7 @@ High request volume could impact performance.
 
 ## Alternatives Considered
 
-We evaluated 6 different approaches (see ALTERNATIVES-LATEST-TRACE-API.md):
+We evaluated 7 different approaches (see ALTERNATIVES-LATEST-TRACE-API.md):
 
 1. ✅ **In-Memory Index** (SELECTED) - Simple, fast, sufficient
 2. SQLite Index - Persistent, more complex
@@ -287,6 +287,7 @@ We evaluated 6 different approaches (see ALTERNATIVES-LATEST-TRACE-API.md):
 4. Metadata Sidecar - Doubles file count
 5. Hybrid Approach - Over-engineered
 6. Redis External - Adds dependency
+7. **Linked-List Navigation** - Advanced: Enables prev/next trace navigation
 
 **Rationale for Selection:**
 In-memory index provides the best balance of:
@@ -295,7 +296,7 @@ In-memory index provides the best balance of:
 - Resource usage (minimal)
 - Risk (lowest)
 
-Can migrate to SQLite (option 2) later if persistence becomes critical.
+Can migrate to SQLite (option 2) later if persistence becomes critical, or to Linked-List approach (option 7) if chronological navigation features are needed.
 
 ## Stakeholder Sign-Off
 
@@ -326,7 +327,7 @@ Document reasons and revisit in Q2 2025.
 
 ## Documentation
 
-Three comprehensive documents have been created:
+Four comprehensive documents have been created:
 
 1. **FEASIBILITY-LATEST-TRACE-API.md**
    - High-level feasibility analysis
@@ -341,7 +342,9 @@ Three comprehensive documents have been created:
    - Testing strategy
 
 3. **ALTERNATIVES-LATEST-TRACE-API.md**
-   - 6 different approaches analyzed
+   - 7 different approaches analyzed
+   - Includes new Linked-List Navigation approach
+   - Pros/cons for each
    - Pros/cons for each
    - Comparison matrix
    - Cost analysis

@@ -20,7 +20,8 @@ If you're looking for a specific aspect of this feature, start here:
 
 ### 🔧 For Architects
 **Read:** [ALTERNATIVES-LATEST-TRACE-API.md](ALTERNATIVES-LATEST-TRACE-API.md)
-- 6 different approaches compared
+- 7 different approaches compared
+- Includes new Linked-List Navigation approach (doubly-linked traces)
 - Trade-off analysis
 - Scalability considerations
 - Migration paths
