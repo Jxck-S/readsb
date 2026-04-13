@@ -877,6 +877,9 @@ struct _Modes
     struct net_connector *net_connectors; // client connectors
     int net_connectors_count;
     int net_connectors_size;
+    struct bincraft_url_source *bincraft_urls; // periodic binCraft HTTP-GET sources
+    int bincraft_urls_count;
+    int bincraft_urls_size;
     int64_t synthetic_now;
     char *uuidFile;
     char *filename; // Input form file, --ifile option
@@ -1340,6 +1343,7 @@ enum {
     OptNetRoIntervalBeastReduce,
     OptNetConnector,
     OptNetConnectorDelay,
+    OptNetBincraftUrl,
     OptNetHeartbeat,
     OptNetBuffer,
     OptTcpBuffersAuto,

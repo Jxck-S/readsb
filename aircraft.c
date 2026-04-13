@@ -446,7 +446,454 @@ void toBinCraft(struct aircraft *a, struct binCraft *new, int64_t now) {
 }
 
 
-// rudimentary sanitization so the json output hopefully won't be invalid
+// fromBinCraft: inverse of toBinCraft — apply a binCraft snapshot record to the local aircraft state.
+// remote_now is the int64 "now" field from the binCraft file header (absolute milliseconds on the remote).
+// The local "now" is derived so that relative timestamps in the record are correctly translated.
+void fromBinCraft(struct binCraft *b, int64_t remote_now) {
+    if (!b || b->hex == 0 || b->hex > 0xFFFFFF)
+        return;
+
+    int64_t local_now = mstime();
+
+    // Translate relative centisecond offsets from the remote snapshot back to absolute local timestamps.
+    // b->seen and b->seen_pos are centiseconds *ago* relative to remote_now.
+    int64_t seen_abs = remote_now - (int64_t)b->seen * 100;
+    // Age of the snapshot itself
+    int64_t snapshot_age = local_now - remote_now;
+    // Clamp: if snapshot is from the future (clock skew), treat as just arrived
+    if (snapshot_age < 0) snapshot_age = 0;
+    int64_t local_seen = seen_abs + snapshot_age;
+
+    // Don't ingest data that is too old to matter
+    if (local_now - local_seen > 30 * MINUTES)
+        return;
+
+    struct aircraft *a = aircraftGet(b->hex);
+    if (!a)
+        a = aircraftCreate(b->hex);
+    if (!a)
+        return;
+
+    // Update the "last seen" timestamp only if the new data is fresher
+    if (local_seen > a->seen)
+        a->seen = local_seen;
+
+    // -- addrtype --
+    // Only raise, never lower addrtype (higher enum value = lower priority address)
+    if (b->addrtype < a->addrtype)
+        a->addrtype = b->addrtype;
+
+    // -- callsign --
+    if (b->callsign_valid && local_now - local_seen < TRACK_EXPIRE_LONG) {
+        if (a->callsign_valid.source == SOURCE_INVALID ||
+                a->callsign_valid.updated < local_seen) {
+            memcpy(a->callsign, b->callsign, sizeof(b->callsign));
+            a->callsign[sizeof(a->callsign) - 1] = '\0';
+            a->callsign_valid.source = SOURCE_SBS;
+            a->callsign_valid.last_source = SOURCE_SBS;
+            a->callsign_valid.updated = local_seen;
+            a->callsign_valid.stale = 0;
+        }
+    }
+
+    // -- position --
+    if (b->position_valid) {
+        int64_t seen_pos_abs = remote_now - (int64_t)b->seen_pos * 100 + snapshot_age;
+        if (seen_pos_abs > a->seenPosReliable && local_now - seen_pos_abs < 30 * MINUTES) {
+            double new_lat = b->lat / 1E6;
+            double new_lon = b->lon / 1E6;
+            // Only accept if coordinates changed or position is brand new
+            if (a->seenPosReliable == 0 ||
+                    (int32_t)(new_lat * 1E6) != (int32_t)(a->latReliable * 1E6) ||
+                    (int32_t)(new_lon * 1E6) != (int32_t)(a->lonReliable * 1E6)) {
+                a->latReliable = new_lat;
+                a->lonReliable = new_lon;
+                a->lat = new_lat;
+                a->lon = new_lon;
+                a->seenPosReliable = seen_pos_abs;
+                a->seen_pos = seen_pos_abs;
+                a->pos_nic = b->pos_nic;
+                a->pos_rc = b->pos_rc;
+                a->pos_nic_reliable = b->pos_nic;
+                a->pos_rc_reliable = b->pos_rc;
+                a->pos_reliable_odd = fmaxf(a->pos_reliable_odd, Modes.json_reliable);
+                a->pos_reliable_even = fmaxf(a->pos_reliable_even, Modes.json_reliable);
+                a->pos_reliable_valid.source = SOURCE_SBS;
+                a->pos_reliable_valid.last_source = SOURCE_SBS;
+                a->pos_reliable_valid.updated = seen_pos_abs;
+                a->pos_reliable_valid.stale = 0;
+                a->position_valid.source = SOURCE_SBS;
+                a->position_valid.last_source = SOURCE_SBS;
+                a->position_valid.updated = seen_pos_abs;
+                a->position_valid.stale = 0;
+                if (Modes.json_globe_index)
+                    set_globe_index(a, globe_index(new_lat, new_lon));
+            }
+        }
+    }
+
+    // Macro to apply a scalar field if the remote record marks it valid and the data is fresher
+#define APPLY_FIELD(field, src_type, expire) \
+    do { \
+        if (b->field##_valid && local_now - local_seen < (expire)) { \
+            if (a->field##_valid.source == SOURCE_INVALID || \
+                    a->field##_valid.updated < local_seen) { \
+                a->field = b->field; \
+                a->field##_valid.source = (src_type); \
+                a->field##_valid.last_source = (src_type); \
+                a->field##_valid.updated = local_seen; \
+                a->field##_valid.stale = 0; \
+            } \
+        } \
+    } while (0)
+
+    float reverse_alt = 1.0f / BINCRAFT_ALT_FACTOR;
+
+    if (b->baro_alt_valid && local_now - local_seen < TRACK_EXPIRE) {
+        if (a->baro_alt_valid.source == SOURCE_INVALID || a->baro_alt_valid.updated < local_seen) {
+            a->baro_alt = (int32_t)(b->baro_alt * reverse_alt);
+            a->baro_alt_valid.source = SOURCE_SBS;
+            a->baro_alt_valid.last_source = SOURCE_SBS;
+            a->baro_alt_valid.updated = local_seen;
+            a->baro_alt_valid.stale = 0;
+        }
+    }
+    if (b->geom_alt_valid && local_now - local_seen < TRACK_EXPIRE) {
+        if (a->geom_alt_valid.source == SOURCE_INVALID || a->geom_alt_valid.updated < local_seen) {
+            a->geom_alt = (int32_t)(b->geom_alt * reverse_alt);
+            a->geom_alt_valid.source = SOURCE_SBS;
+            a->geom_alt_valid.last_source = SOURCE_SBS;
+            a->geom_alt_valid.updated = local_seen;
+            a->geom_alt_valid.stale = 0;
+        }
+    }
+
+    if (b->baro_rate_valid && local_now - local_seen < TRACK_EXPIRE) {
+        if (a->baro_rate_valid.source == SOURCE_INVALID || a->baro_rate_valid.updated < local_seen) {
+            a->baro_rate = (int32_t)b->baro_rate * 8;
+            a->baro_rate_valid.source = SOURCE_SBS;
+            a->baro_rate_valid.last_source = SOURCE_SBS;
+            a->baro_rate_valid.updated = local_seen;
+            a->baro_rate_valid.stale = 0;
+        }
+    }
+    if (b->geom_rate_valid && local_now - local_seen < TRACK_EXPIRE) {
+        if (a->geom_rate_valid.source == SOURCE_INVALID || a->geom_rate_valid.updated < local_seen) {
+            a->geom_rate = (int32_t)b->geom_rate * 8;
+            a->geom_rate_valid.source = SOURCE_SBS;
+            a->geom_rate_valid.last_source = SOURCE_SBS;
+            a->geom_rate_valid.updated = local_seen;
+            a->geom_rate_valid.stale = 0;
+        }
+    }
+
+    if (b->gs_valid && local_now - local_seen < TRACK_EXPIRE) {
+        if (a->gs_valid.source == SOURCE_INVALID || a->gs_valid.updated < local_seen) {
+            a->gs = b->gs / 10.0f;
+            a->gs_valid.source = SOURCE_SBS;
+            a->gs_valid.last_source = SOURCE_SBS;
+            a->gs_valid.updated = local_seen;
+            a->gs_valid.stale = 0;
+        }
+    }
+
+    if (b->ias_valid && local_now - local_seen < TRACK_EXPIRE) {
+        if (a->ias_valid.source == SOURCE_INVALID || a->ias_valid.updated < local_seen) {
+            a->ias = b->ias;
+            a->ias_valid.source = SOURCE_SBS;
+            a->ias_valid.last_source = SOURCE_SBS;
+            a->ias_valid.updated = local_seen;
+            a->ias_valid.stale = 0;
+        }
+    }
+    if (b->tas_valid && local_now - local_seen < TRACK_EXPIRE) {
+        if (a->tas_valid.source == SOURCE_INVALID || a->tas_valid.updated < local_seen) {
+            a->tas = b->tas;
+            a->tas_valid.source = SOURCE_SBS;
+            a->tas_valid.last_source = SOURCE_SBS;
+            a->tas_valid.updated = local_seen;
+            a->tas_valid.stale = 0;
+        }
+    }
+    if (b->mach_valid && local_now - local_seen < TRACK_EXPIRE) {
+        if (a->mach_valid.source == SOURCE_INVALID || a->mach_valid.updated < local_seen) {
+            a->mach = b->mach / 1000.0f;
+            a->mach_valid.source = SOURCE_SBS;
+            a->mach_valid.last_source = SOURCE_SBS;
+            a->mach_valid.updated = local_seen;
+            a->mach_valid.stale = 0;
+        }
+    }
+
+    if (b->track_valid && local_now - local_seen < TRACK_EXPIRE) {
+        if (a->track_valid.source == SOURCE_INVALID || a->track_valid.updated < local_seen) {
+            a->track = b->track / 90.0f;
+            a->track_valid.source = SOURCE_SBS;
+            a->track_valid.last_source = SOURCE_SBS;
+            a->track_valid.updated = local_seen;
+            a->track_valid.stale = 0;
+        }
+    }
+    if (b->track_rate_valid && local_now - local_seen < TRACK_EXPIRE) {
+        if (a->track_rate_valid.source == SOURCE_INVALID || a->track_rate_valid.updated < local_seen) {
+            a->track_rate = b->track_rate / 100.0f;
+            a->track_rate_valid.source = SOURCE_SBS;
+            a->track_rate_valid.last_source = SOURCE_SBS;
+            a->track_rate_valid.updated = local_seen;
+            a->track_rate_valid.stale = 0;
+        }
+    }
+    if (b->roll_valid && local_now - local_seen < TRACK_EXPIRE) {
+        if (a->roll_valid.source == SOURCE_INVALID || a->roll_valid.updated < local_seen) {
+            a->roll = b->roll / 100.0f;
+            a->roll_valid.source = SOURCE_SBS;
+            a->roll_valid.last_source = SOURCE_SBS;
+            a->roll_valid.updated = local_seen;
+            a->roll_valid.stale = 0;
+        }
+    }
+    if (b->mag_heading_valid && local_now - local_seen < TRACK_EXPIRE) {
+        if (a->mag_heading_valid.source == SOURCE_INVALID || a->mag_heading_valid.updated < local_seen) {
+            a->mag_heading = b->mag_heading / 90.0f;
+            a->mag_heading_valid.source = SOURCE_SBS;
+            a->mag_heading_valid.last_source = SOURCE_SBS;
+            a->mag_heading_valid.updated = local_seen;
+            a->mag_heading_valid.stale = 0;
+        }
+    }
+    if (b->true_heading_valid && local_now - local_seen < TRACK_EXPIRE) {
+        if (a->true_heading_valid.source == SOURCE_INVALID || a->true_heading_valid.updated < local_seen) {
+            a->true_heading = b->true_heading / 90.0f;
+            a->true_heading_valid.source = SOURCE_SBS;
+            a->true_heading_valid.last_source = SOURCE_SBS;
+            a->true_heading_valid.updated = local_seen;
+            a->true_heading_valid.stale = 0;
+        }
+    }
+
+    if (b->squawk_valid && local_now - local_seen < TRACK_EXPIRE) {
+        if (a->squawk_valid.source == SOURCE_INVALID || a->squawk_valid.updated < local_seen) {
+            a->squawk = b->squawk;
+            a->squawk_valid.source = SOURCE_SBS;
+            a->squawk_valid.last_source = SOURCE_SBS;
+            a->squawk_valid.updated = local_seen;
+            a->squawk_valid.stale = 0;
+        }
+    }
+    if (b->emergency_valid && local_now - local_seen < TRACK_EXPIRE) {
+        if (a->emergency_valid.source == SOURCE_INVALID || a->emergency_valid.updated < local_seen) {
+            a->emergency = b->emergency;
+            a->emergency_valid.source = SOURCE_SBS;
+            a->emergency_valid.last_source = SOURCE_SBS;
+            a->emergency_valid.updated = local_seen;
+            a->emergency_valid.stale = 0;
+        }
+    }
+    if (b->spi_valid && local_now - local_seen < TRACK_EXPIRE) {
+        if (a->spi_valid.source == SOURCE_INVALID || a->spi_valid.updated < local_seen) {
+            a->spi = b->spi;
+            a->spi_valid.source = SOURCE_SBS;
+            a->spi_valid.last_source = SOURCE_SBS;
+            a->spi_valid.updated = local_seen;
+            a->spi_valid.stale = 0;
+        }
+    }
+    if (b->alert_valid && local_now - local_seen < TRACK_EXPIRE) {
+        if (a->alert_valid.source == SOURCE_INVALID || a->alert_valid.updated < local_seen) {
+            a->alert = b->alert;
+            a->alert_valid.source = SOURCE_SBS;
+            a->alert_valid.last_source = SOURCE_SBS;
+            a->alert_valid.updated = local_seen;
+            a->alert_valid.stale = 0;
+        }
+    }
+
+    // -- airground --
+    if (b->airground != AG_INVALID && local_now - local_seen < TRACK_EXPIRE_LONG) {
+        if (a->airground_valid.source == SOURCE_INVALID || a->airground_valid.updated < local_seen) {
+            a->airground = b->airground;
+            a->airground_valid.source = SOURCE_SBS;
+            a->airground_valid.last_source = SOURCE_SBS;
+            a->airground_valid.updated = local_seen;
+            a->airground_valid.stale = 0;
+        }
+    }
+
+    // -- nav fields --
+    if (b->nav_altitude_mcp_valid && local_now - local_seen < TRACK_EXPIRE) {
+        if (a->nav_altitude_mcp_valid.source == SOURCE_INVALID || a->nav_altitude_mcp_valid.updated < local_seen) {
+            a->nav_altitude_mcp = (uint32_t)b->nav_altitude_mcp * 4;
+            a->nav_altitude_mcp_valid.source = SOURCE_SBS;
+            a->nav_altitude_mcp_valid.last_source = SOURCE_SBS;
+            a->nav_altitude_mcp_valid.updated = local_seen;
+            a->nav_altitude_mcp_valid.stale = 0;
+        }
+    }
+    if (b->nav_altitude_fms_valid && local_now - local_seen < TRACK_EXPIRE) {
+        if (a->nav_altitude_fms_valid.source == SOURCE_INVALID || a->nav_altitude_fms_valid.updated < local_seen) {
+            a->nav_altitude_fms = (uint32_t)b->nav_altitude_fms * 4;
+            a->nav_altitude_fms_valid.source = SOURCE_SBS;
+            a->nav_altitude_fms_valid.last_source = SOURCE_SBS;
+            a->nav_altitude_fms_valid.updated = local_seen;
+            a->nav_altitude_fms_valid.stale = 0;
+        }
+    }
+    if (b->nav_altitude_src_valid && local_now - local_seen < TRACK_EXPIRE) {
+        if (a->nav_altitude_src_valid.source == SOURCE_INVALID || a->nav_altitude_src_valid.updated < local_seen) {
+            a->nav_altitude_src = b->nav_altitude_src;
+            a->nav_altitude_src_valid.source = SOURCE_SBS;
+            a->nav_altitude_src_valid.last_source = SOURCE_SBS;
+            a->nav_altitude_src_valid.updated = local_seen;
+            a->nav_altitude_src_valid.stale = 0;
+        }
+    }
+    if (b->nav_qnh_valid && local_now - local_seen < TRACK_EXPIRE) {
+        if (a->nav_qnh_valid.source == SOURCE_INVALID || a->nav_qnh_valid.updated < local_seen) {
+            a->nav_qnh = b->nav_qnh / 10.0f;
+            a->nav_qnh_valid.source = SOURCE_SBS;
+            a->nav_qnh_valid.last_source = SOURCE_SBS;
+            a->nav_qnh_valid.updated = local_seen;
+            a->nav_qnh_valid.stale = 0;
+        }
+    }
+    if (b->nav_heading_valid && local_now - local_seen < TRACK_EXPIRE) {
+        if (a->nav_heading_valid.source == SOURCE_INVALID || a->nav_heading_valid.updated < local_seen) {
+            a->nav_heading = b->nav_heading / 90.0f;
+            a->nav_heading_valid.source = SOURCE_SBS;
+            a->nav_heading_valid.last_source = SOURCE_SBS;
+            a->nav_heading_valid.updated = local_seen;
+            a->nav_heading_valid.stale = 0;
+        }
+    }
+    if (b->nav_modes_valid && local_now - local_seen < TRACK_EXPIRE) {
+        if (a->nav_modes_valid.source == SOURCE_INVALID || a->nav_modes_valid.updated < local_seen) {
+            a->nav_modes = b->nav_modes;
+            a->nav_modes_valid.source = SOURCE_SBS;
+            a->nav_modes_valid.last_source = SOURCE_SBS;
+            a->nav_modes_valid.updated = local_seen;
+            a->nav_modes_valid.stale = 0;
+        }
+    }
+
+    // -- wind / temp --
+    if (b->wind_valid && local_now - local_seen < TRACK_EXPIRE) {
+        a->wind_speed = b->wind_speed;
+        a->wind_direction = b->wind_direction;
+        a->wind_altitude = a->baro_alt;
+        a->wind_updated = local_seen;
+    }
+    if (b->temp_valid && local_now - local_seen < TRACK_EXPIRE) {
+        a->oat = b->oat;
+        a->tat = b->tat;
+        a->oat_updated = local_seen;
+        a->tat_updated = local_seen;
+    }
+
+    // -- NIC / NAC / SIL / GVA / SDA validity bits --
+    if (b->nic_a_valid && local_now - local_seen < TRACK_EXPIRE) {
+        if (a->nic_a_valid.source == SOURCE_INVALID || a->nic_a_valid.updated < local_seen) {
+            a->nic_a = b->nic_a;
+            a->nic_a_valid.source = SOURCE_SBS;
+            a->nic_a_valid.last_source = SOURCE_SBS;
+            a->nic_a_valid.updated = local_seen;
+            a->nic_a_valid.stale = 0;
+        }
+    }
+    if (b->nic_c_valid && local_now - local_seen < TRACK_EXPIRE) {
+        if (a->nic_c_valid.source == SOURCE_INVALID || a->nic_c_valid.updated < local_seen) {
+            a->nic_c = b->nic_c;
+            a->nic_c_valid.source = SOURCE_SBS;
+            a->nic_c_valid.last_source = SOURCE_SBS;
+            a->nic_c_valid.updated = local_seen;
+            a->nic_c_valid.stale = 0;
+        }
+    }
+    if (b->nic_baro_valid && local_now - local_seen < TRACK_EXPIRE) {
+        if (a->nic_baro_valid.source == SOURCE_INVALID || a->nic_baro_valid.updated < local_seen) {
+            a->nic_baro = b->nic_baro;
+            a->nic_baro_valid.source = SOURCE_SBS;
+            a->nic_baro_valid.last_source = SOURCE_SBS;
+            a->nic_baro_valid.updated = local_seen;
+            a->nic_baro_valid.stale = 0;
+        }
+    }
+    if (b->nac_p_valid && local_now - local_seen < TRACK_EXPIRE) {
+        if (a->nac_p_valid.source == SOURCE_INVALID || a->nac_p_valid.updated < local_seen) {
+            a->nac_p = b->nac_p;
+            a->nac_p_valid.source = SOURCE_SBS;
+            a->nac_p_valid.last_source = SOURCE_SBS;
+            a->nac_p_valid.updated = local_seen;
+            a->nac_p_valid.stale = 0;
+        }
+    }
+    if (b->nac_v_valid && local_now - local_seen < TRACK_EXPIRE) {
+        if (a->nac_v_valid.source == SOURCE_INVALID || a->nac_v_valid.updated < local_seen) {
+            a->nac_v = b->nac_v;
+            a->nac_v_valid.source = SOURCE_SBS;
+            a->nac_v_valid.last_source = SOURCE_SBS;
+            a->nac_v_valid.updated = local_seen;
+            a->nac_v_valid.stale = 0;
+        }
+    }
+    if (b->sil_valid && local_now - local_seen < TRACK_EXPIRE) {
+        if (a->sil_valid.source == SOURCE_INVALID || a->sil_valid.updated < local_seen) {
+            a->sil = b->sil;
+            a->sil_valid.source = SOURCE_SBS;
+            a->sil_valid.last_source = SOURCE_SBS;
+            a->sil_valid.updated = local_seen;
+            a->sil_valid.stale = 0;
+        }
+    }
+    if (b->gva_valid && local_now - local_seen < TRACK_EXPIRE) {
+        if (a->gva_valid.source == SOURCE_INVALID || a->gva_valid.updated < local_seen) {
+            a->gva = b->gva;
+            a->gva_valid.source = SOURCE_SBS;
+            a->gva_valid.last_source = SOURCE_SBS;
+            a->gva_valid.updated = local_seen;
+            a->gva_valid.stale = 0;
+        }
+    }
+    if (b->sda_valid && local_now - local_seen < TRACK_EXPIRE) {
+        if (a->sda_valid.source == SOURCE_INVALID || a->sda_valid.updated < local_seen) {
+            a->sda = b->sda;
+            a->sda_valid.source = SOURCE_SBS;
+            a->sda_valid.last_source = SOURCE_SBS;
+            a->sda_valid.updated = local_seen;
+            a->sda_valid.stale = 0;
+        }
+    }
+
+    // -- ADS-B / ADS-R / TIS-B version --
+    if (b->adsb_version != 15) { // 15 == not seen
+        a->adsb_version = (int32_t)b->adsb_version;
+    }
+    if (b->adsr_version != 15) {
+        a->adsr_version = (int32_t)b->adsr_version;
+    }
+    if (b->tisb_version != 15) {
+        a->tisb_version = (int32_t)b->tisb_version;
+    }
+
+    a->sil_type = b->sil_type;
+
+    // -- category --
+    if (b->category && local_now - local_seen < Modes.trackExpireJaero) {
+        if (a->category == 0 || a->category_updated < local_seen) {
+            a->category = b->category;
+            a->category_updated = local_seen;
+        }
+    }
+
+    // -- Add aircraft to active list so all outputs can see it --
+    if (!a->onActiveList && includeAircraftJson(local_now, a)) {
+        updateValidities(a, local_now);
+        ca_add(&Modes.aircraftActive, a);
+        a->onActiveList = 1;
+    }
+
+#undef APPLY_FIELD
+}
+
 static inline void sanitize(char *str, int len) {
     unsigned char b2 = (1<<7) + (1<<6); // 2 byte code or more
     unsigned char b3 = (1<<7) + (1<<6) + (1<<5); // 3 byte code or more

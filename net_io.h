@@ -187,6 +187,12 @@ struct net_connector
     char *uuid;
 };
 
+struct bincraft_url_source {
+    char *url;              // full HTTP URL to fetch (http only, no TLS)
+    int64_t interval_ms;    // fetch interval in milliseconds
+    int64_t next_fetch;     // absolute mstime() for next fetch
+};
+
 // Common writer state for all output sockets of one type
 
 struct net_writer

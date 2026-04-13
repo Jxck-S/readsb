@@ -182,6 +182,7 @@ struct binCraft {
 } __attribute__ ((__packed__));
 
 void toBinCraft(struct aircraft *a, struct binCraft *new, int64_t now);
+void fromBinCraft(struct binCraft *b, int64_t remote_now);
 int dbUpdate(int64_t now);
 int dbFinishUpdate();
 

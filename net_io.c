@@ -5755,6 +5755,7 @@ static void decodeTask(void *arg, threadpool_threadbuffers_t *buffer_group) {
 //
 // Perform periodic network work
 //
+static void fetchBinCraftUrls(int64_t now);
 void modesNetPeriodicWork(void) {
     static int64_t check_flush;
     static int64_t next_tcp_json;
@@ -5899,6 +5900,10 @@ void modesNetPeriodicWork(void) {
             Modes.next_reconnect_callback = now + Modes.net_connector_delay_min;
         }
         serviceReconnectCallback(now);
+    }
+
+    if (Modes.bincraft_urls_count > 0) {
+        fetchBinCraftUrls(now);
     }
 
     static int64_t next_free_clients;
@@ -6122,6 +6127,12 @@ void cleanupNetwork(void) {
     sfree(Modes.net_events);
 
     Modes.net_connectors_count = 0;
+
+    for (int i = 0; i < Modes.bincraft_urls_count; i++) {
+        sfree(Modes.bincraft_urls[i].url);
+    }
+    sfree(Modes.bincraft_urls);
+    Modes.bincraft_urls_count = 0;
 
 }
 
@@ -6409,3 +6420,213 @@ void netDrainMessageBuffers() {
         drainMessageBuffer(mb);
     }
 }
+
+// ------------------------------------------------------------------
+// Periodic binCraft URL fetch
+// ------------------------------------------------------------------
+
+// Parse a binCraft header to extract the remote "now" timestamp and elementSize.
+// Returns 1 on success, 0 on failure.
+// buf must be at least elementSize bytes.
+static int parseBinCraftHeader(const char *buf, size_t buflen, int64_t *remote_now_out, uint32_t *element_size_out) {
+    if (buflen < sizeof(struct binCraft))
+        return 0;
+
+    // Header layout (see generateAircraftBin):
+    //   int64_t  now                (8)
+    //   uint32_t elementSize        (4)
+    //   uint32_t ac_count_pos       (4)
+    //   uint32_t index              (4)
+    //   int16_t  south,west,north,east (8)
+    //   uint32_t messageCount       (4)
+    //   int32_t  receiver_lat       (4)
+    //   int32_t  receiver_lon       (4)
+    //   uint32_t binCraftVersion    (4)
+    //   uint32_t messageRate        (4)
+    //   uint32_t flags              (4)
+    // Total used so far: 52 bytes, but the whole header occupies elementSize bytes
+
+    int64_t  remote_now;
+    uint32_t elementSize;
+    uint32_t binCraftVersion;
+
+    memcpy(&remote_now,      buf +  0, sizeof(remote_now));
+    memcpy(&elementSize,     buf +  8, sizeof(elementSize));
+    memcpy(&binCraftVersion, buf + 44, sizeof(binCraftVersion));
+
+    if (elementSize != sizeof(struct binCraft)) {
+        fprintf(stderr, "binCraft URL: elementSize mismatch: remote %u local %zu – skipping\n",
+                elementSize, sizeof(struct binCraft));
+        return 0;
+    }
+    if (binCraftVersion != Modes.binCraftVersion) {
+        fprintf(stderr, "binCraft URL: version mismatch: remote %u local %u – skipping\n",
+                binCraftVersion, Modes.binCraftVersion);
+        return 0;
+    }
+
+    *remote_now_out    = remote_now;
+    *element_size_out  = elementSize;
+    return 1;
+}
+
+// Send a minimal HTTP/1.0 GET, read the entire response body, and return a
+// heap-allocated buffer.  *body_out points to the first byte after the HTTP
+// header (the actual payload).  *total_len is the number of valid bytes in
+// *buf_out.  Caller must free(*buf_out).
+// Returns 1 on success, 0 on any error.
+static int httpGetBinCraft(const char *url, char **buf_out, size_t *total_len) {
+    // Parse url: http://host[:port]/path
+    if (strncmp(url, "http://", 7) != 0) {
+        fprintf(stderr, "binCraft URL: only http:// supported: %s\n", url);
+        return 0;
+    }
+    const char *hoststart = url + 7;
+    const char *slash = strchr(hoststart, '/');
+    const char *path = slash ? slash : "/";
+
+    char host[256];
+    char port[16];
+    strcpy(port, "80");
+    const char *portcolon = NULL;
+    size_t hostlen;
+    if (slash) {
+        portcolon = memchr(hoststart, ':', (size_t)(slash - hoststart));
+        hostlen = portcolon ? (size_t)(portcolon - hoststart) : (size_t)(slash - hoststart);
+    } else {
+        portcolon = strchr(hoststart, ':');
+        hostlen = portcolon ? (size_t)(portcolon - hoststart) : strlen(hoststart);
+    }
+    if (hostlen == 0 || hostlen >= sizeof(host)) {
+        fprintf(stderr, "binCraft URL: invalid host: %s\n", url);
+        return 0;
+    }
+    memcpy(host, hoststart, hostlen);
+    host[hostlen] = '\0';
+    if (portcolon) {
+        const char *portend = slash ? slash : portcolon + strlen(portcolon);
+        size_t portlen = (size_t)(portend - (portcolon + 1));
+        if (portlen > 0 && portlen < sizeof(port)) {
+            memcpy(port, portcolon + 1, portlen);
+            port[portlen] = '\0';
+        }
+    }
+
+    // Resolve and connect (blocking – called from the network thread with decode mutex held, but
+    // the decode mutex is temporarily released during epoll_wait; we hold it here.  Since fetches
+    // happen at most once per interval_ms and with a short timeout this is acceptable.)
+    char errbuf[256];
+    int fd = anetTcpConnect(errbuf, host, port, NULL);
+    if (fd < 0) {
+        static int64_t antiSpam;
+        int64_t now2 = mstime();
+        if (now2 > antiSpam + 30 * SECONDS) {
+            antiSpam = now2;
+            fprintf(stderr, "binCraft URL: connect %s:%s failed: %s\n", host, port, errbuf);
+        }
+        return 0;
+    }
+
+    // Set a 10-second read timeout
+    struct timeval tv = { .tv_sec = 10, .tv_usec = 0 };
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+    // Send request
+    char request[1024];
+    int reqlen = snprintf(request, sizeof(request),
+            "GET %s HTTP/1.0\r\nHost: %s\r\nAccept: */*\r\nConnection: close\r\n\r\n",
+            path, host);
+    if (anetWrite(fd, request, reqlen) != reqlen) {
+        close(fd);
+        return 0;
+    }
+
+    // Read response
+    size_t alloc = 1024 * 1024; // start with 1 MB
+    char *buf = malloc(alloc);
+    if (!buf) { close(fd); return 0; }
+    size_t received = 0;
+
+    while (1) {
+        if (received + 65536 > alloc) {
+            alloc *= 2;
+            char *tmp = realloc(buf, alloc);
+            if (!tmp) { free(buf); close(fd); return 0; }
+            buf = tmp;
+        }
+        ssize_t n = read(fd, buf + received, alloc - received - 1);
+        if (n <= 0) break;
+        received += (size_t)n;
+    }
+    close(fd);
+
+    if (received < 12) { free(buf); return 0; } // too small to have an HTTP header + payload
+
+    // Find end of HTTP header (\r\n\r\n)
+    buf[received] = '\0';
+    char *body = strstr(buf, "\r\n\r\n");
+    if (!body) { free(buf); return 0; }
+    body += 4;
+
+    // Check HTTP status line
+    if (strncmp(buf, "HTTP/", 5) != 0) { free(buf); return 0; }
+    int status = 0;
+    sscanf(buf + 9, "%d", &status);
+    if (status != 200) {
+        static int64_t antiSpam;
+        int64_t now2 = mstime();
+        if (now2 > antiSpam + 30 * SECONDS) {
+            antiSpam = now2;
+            fprintf(stderr, "binCraft URL: HTTP %d from %s\n", status, url);
+        }
+        free(buf);
+        return 0;
+    }
+
+    *buf_out   = buf;
+    *total_len = (size_t)(buf + received - body);
+    // shift body to buf start for simpler caller access
+    memmove(buf, body, *total_len);
+    return 1;
+}
+
+static void fetchBinCraftUrls(int64_t now) {
+    for (int i = 0; i < Modes.bincraft_urls_count; i++) {
+        struct bincraft_url_source *src = &Modes.bincraft_urls[i];
+        if (now < src->next_fetch)
+            continue;
+
+        src->next_fetch = now + src->interval_ms;
+
+        char *buf = NULL;
+        size_t body_len = 0;
+        if (!httpGetBinCraft(src->url, &buf, &body_len)) {
+            continue;
+        }
+
+        int64_t remote_now = 0;
+        uint32_t elementSize = 0;
+        if (!parseBinCraftHeader(buf, body_len, &remote_now, &elementSize)) {
+            free(buf);
+            continue;
+        }
+
+        // Skip the header block (first elementSize bytes) and iterate records
+        size_t offset = elementSize;
+        int count = 0;
+        while (offset + elementSize <= body_len) {
+            struct binCraft *b = (struct binCraft *)(buf + offset);
+            if (b->hex != 0)
+                fromBinCraft(b, remote_now);
+            offset += elementSize;
+            count++;
+        }
+
+        free(buf);
+
+        if (Modes.debug_net) {
+            fprintf(stderr, "binCraft URL: fetched %s: %d aircraft\n", src->url, count);
+        }
+    }
+}
+

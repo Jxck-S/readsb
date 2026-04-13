@@ -2103,6 +2103,34 @@ static error_t parse_opt(int key, char *arg, struct argp_state *state) {
             Modes.net_connector_delay = (int64_t) (1000 * atof(arg));
             break;
 
+        case OptNetBincraftUrl:
+            {
+                if (!Modes.bincraft_urls || Modes.bincraft_urls_count + 1 > Modes.bincraft_urls_size) {
+                    Modes.bincraft_urls_size = Modes.bincraft_urls_count * 2 + 4;
+                    Modes.bincraft_urls = realloc(Modes.bincraft_urls,
+                            sizeof(struct bincraft_url_source) * (size_t) Modes.bincraft_urls_size);
+                    if (!Modes.bincraft_urls) {
+                        fprintf(stderr, "realloc error bincraft_urls\n");
+                        exit(1);
+                    }
+                }
+                struct bincraft_url_source *src = &Modes.bincraft_urls[Modes.bincraft_urls_count++];
+                memset(src, 0, sizeof(*src));
+                char *argcopy = strdup(arg);
+                // Format: url,interval_seconds
+                char *comma = strrchr(argcopy, ',');
+                double interval_secs = 15.0;
+                if (comma) {
+                    *comma = '\0';
+                    interval_secs = atof(comma + 1);
+                    if (interval_secs < 1.0) interval_secs = 1.0;
+                }
+                src->url = argcopy; // owns the allocation
+                src->interval_ms = (int64_t)(interval_secs * 1000.0);
+                src->next_fetch = 0; // fetch on first periodic work call
+            }
+            break;
+
         case OptTraceFocus:
             Modes.trace_focus = (uint32_t) strtol(arg, NULL, 16);
             Modes.interactive = 0;
