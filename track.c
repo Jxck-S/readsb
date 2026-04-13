@@ -2658,21 +2658,26 @@ struct aircraft *trackUpdateFromMessage(struct modesMessage *mm) {
     }
 
     if (mm->sbs_in && mm->sbs_pos_valid) {
-        int old_jaero = 0;
-        if (mm->source == SOURCE_JAERO && a->trace_len > 0) {
+        int old_pos = 0;
+        if (a->trace_len > 0) {
             spinLock(&a->traceLock);
             for (int i = imax(0, a->trace_current_len - 10); i < a->trace_current_len; i++) {
                 if ( (int32_t) (mm->decoded_lat * 1E6) == getState(a->trace_current, i)->lat
                         && (int32_t) (mm->decoded_lon * 1E6) == getState(a->trace_current, i)->lon )
-                    old_jaero = 1;
+                    old_pos = 1;
             }
             spinRelease(&a->traceLock);
+        }
+        if (!old_pos && a->seenPosReliable
+                && (int32_t)(mm->decoded_lat * 1E6) == (int32_t)(a->latReliable * 1E6)
+                && (int32_t)(mm->decoded_lon * 1E6) == (int32_t)(a->lonReliable * 1E6)) {
+            old_pos = 1;
         }
         if (Modes.maxRange > 0 && Modes.userLocationValid) {
             mm->receiver_distance = greatcircle(Modes.fUserLat, Modes.fUserLon, mm->decoded_lat, mm->decoded_lon, 0);
         }
-        if (old_jaero) {
-            // avoid using already received positions for JAERO input
+        if (old_pos) {
+            // avoid using already received positions for SBS input
         } else if (mm->receiver_distance > Modes.maxRange && mm->source != SOURCE_JAERO) {
             // ignore positions out of receiver range unless it's jaero
         } else if (mm->source == SOURCE_MLAT && mm->mlatEPU > 2 * a->mlatEPU
