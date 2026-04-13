@@ -6487,7 +6487,7 @@ static int httpGetBinCraft(const char *url, char **buf_out, size_t *total_len) {
 
     char host[256];
     char port[16];
-    strcpy(port, "80");
+    memcpy(port, "80", 3); // "80\0"
     const char *portcolon = NULL;
     size_t hostlen;
     if (slash) {
@@ -6541,20 +6541,20 @@ static int httpGetBinCraft(const char *url, char **buf_out, size_t *total_len) {
         return 0;
     }
 
-    // Read response
-    size_t alloc = 1024 * 1024; // start with 1 MB
+    // Read response; allocate one extra byte so we can safely null-terminate for strstr
+    size_t alloc = 1024 * 1024 + 1; // start with 1 MB + 1 byte for null terminator
     char *buf = malloc(alloc);
     if (!buf) { close(fd); return 0; }
     size_t received = 0;
 
     while (1) {
-        if (received + 65536 > alloc) {
-            alloc *= 2;
+        if (received + 65536 + 1 > alloc) {
+            alloc = alloc * 2 + 1;
             char *tmp = realloc(buf, alloc);
             if (!tmp) { free(buf); close(fd); return 0; }
             buf = tmp;
         }
-        ssize_t n = read(fd, buf + received, alloc - received - 1);
+        ssize_t n = read(fd, buf + received, alloc - received - 1); // reserve 1 byte for null terminator
         if (n <= 0) break;
         received += (size_t)n;
     }
@@ -6563,15 +6563,18 @@ static int httpGetBinCraft(const char *url, char **buf_out, size_t *total_len) {
     if (received < 12) { free(buf); return 0; } // too small to have an HTTP header + payload
 
     // Find end of HTTP header (\r\n\r\n)
-    buf[received] = '\0';
+    buf[received] = '\0'; // safe: alloc is always at least received + 1
     char *body = strstr(buf, "\r\n\r\n");
     if (!body) { free(buf); return 0; }
     body += 4;
 
-    // Check HTTP status line
+    // Check HTTP status line: "HTTP/x.x NNN ..."
     if (strncmp(buf, "HTTP/", 5) != 0) { free(buf); return 0; }
     int status = 0;
-    sscanf(buf + 9, "%d", &status);
+    // Find the first space after the HTTP version token to locate the status code
+    char *sp = strchr(buf + 5, ' ');
+    if (!sp) { free(buf); return 0; }
+    sscanf(sp + 1, "%d", &status);
     if (status != 200) {
         static int64_t antiSpam;
         int64_t now2 = mstime();

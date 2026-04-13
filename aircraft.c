@@ -532,26 +532,11 @@ void fromBinCraft(struct binCraft *b, int64_t remote_now) {
         }
     }
 
-    // Macro to apply a scalar field if the remote record marks it valid and the data is fresher
-#define APPLY_FIELD(field, src_type, expire) \
-    do { \
-        if (b->field##_valid && local_now - local_seen < (expire)) { \
-            if (a->field##_valid.source == SOURCE_INVALID || \
-                    a->field##_valid.updated < local_seen) { \
-                a->field = b->field; \
-                a->field##_valid.source = (src_type); \
-                a->field##_valid.last_source = (src_type); \
-                a->field##_valid.updated = local_seen; \
-                a->field##_valid.stale = 0; \
-            } \
-        } \
-    } while (0)
-
-    float reverse_alt = 1.0f / BINCRAFT_ALT_FACTOR;
+    float alt_scale_factor = 1.0f / BINCRAFT_ALT_FACTOR;
 
     if (b->baro_alt_valid && local_now - local_seen < TRACK_EXPIRE) {
         if (a->baro_alt_valid.source == SOURCE_INVALID || a->baro_alt_valid.updated < local_seen) {
-            a->baro_alt = (int32_t)(b->baro_alt * reverse_alt);
+            a->baro_alt = (int32_t)(b->baro_alt * alt_scale_factor);
             a->baro_alt_valid.source = SOURCE_SBS;
             a->baro_alt_valid.last_source = SOURCE_SBS;
             a->baro_alt_valid.updated = local_seen;
@@ -560,7 +545,7 @@ void fromBinCraft(struct binCraft *b, int64_t remote_now) {
     }
     if (b->geom_alt_valid && local_now - local_seen < TRACK_EXPIRE) {
         if (a->geom_alt_valid.source == SOURCE_INVALID || a->geom_alt_valid.updated < local_seen) {
-            a->geom_alt = (int32_t)(b->geom_alt * reverse_alt);
+            a->geom_alt = (int32_t)(b->geom_alt * alt_scale_factor);
             a->geom_alt_valid.source = SOURCE_SBS;
             a->geom_alt_valid.last_source = SOURCE_SBS;
             a->geom_alt_valid.updated = local_seen;
@@ -777,16 +762,22 @@ void fromBinCraft(struct binCraft *b, int64_t remote_now) {
 
     // -- wind / temp --
     if (b->wind_valid && local_now - local_seen < TRACK_EXPIRE) {
-        a->wind_speed = b->wind_speed;
-        a->wind_direction = b->wind_direction;
-        a->wind_altitude = a->baro_alt;
-        a->wind_updated = local_seen;
+        if (!a->wind_updated || a->wind_updated < local_seen) {
+            a->wind_speed = b->wind_speed;
+            a->wind_direction = b->wind_direction;
+            a->wind_altitude = a->baro_alt;
+            a->wind_updated = local_seen;
+        }
     }
     if (b->temp_valid && local_now - local_seen < TRACK_EXPIRE) {
-        a->oat = b->oat;
-        a->tat = b->tat;
-        a->oat_updated = local_seen;
-        a->tat_updated = local_seen;
+        if (!a->oat_updated || a->oat_updated < local_seen) {
+            a->oat = b->oat;
+            a->oat_updated = local_seen;
+        }
+        if (!a->tat_updated || a->tat_updated < local_seen) {
+            a->tat = b->tat;
+            a->tat_updated = local_seen;
+        }
     }
 
     // -- NIC / NAC / SIL / GVA / SDA validity bits --
@@ -877,7 +868,7 @@ void fromBinCraft(struct binCraft *b, int64_t remote_now) {
     a->sil_type = b->sil_type;
 
     // -- category --
-    if (b->category && local_now - local_seen < Modes.trackExpireJaero) {
+    if (b->category && local_now - local_seen < TRACK_EXPIRE_LONG) {
         if (a->category == 0 || a->category_updated < local_seen) {
             a->category = b->category;
             a->category_updated = local_seen;
@@ -890,8 +881,6 @@ void fromBinCraft(struct binCraft *b, int64_t remote_now) {
         ca_add(&Modes.aircraftActive, a);
         a->onActiveList = 1;
     }
-
-#undef APPLY_FIELD
 }
 
 static inline void sanitize(char *str, int len) {

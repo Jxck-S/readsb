@@ -2117,8 +2117,8 @@ static error_t parse_opt(int key, char *arg, struct argp_state *state) {
                 struct bincraft_url_source *src = &Modes.bincraft_urls[Modes.bincraft_urls_count++];
                 memset(src, 0, sizeof(*src));
                 char *argcopy = strdup(arg);
-                // Format: url,interval_seconds
-                char *comma = strrchr(argcopy, ',');
+                // Format: url,interval_seconds  (URL must not contain literal commas; they'd be %2C)
+                char *comma = strchr(argcopy, ',');
                 double interval_secs = 15.0;
                 if (comma) {
                     *comma = '\0';
